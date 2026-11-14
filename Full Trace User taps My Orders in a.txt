@@ -1,0 +1,115 @@
+Full Trace: User taps "My Orders" in a food delivery app
+
+Step 1 — DNS Lookup
+
+The app needs to talk to api.foodapp.com, but that's just a name — it needs an actual IP address to connect to.
+
+The device first checks its local DNS cache. Since the user has probably opened this app before, there's a good chance the IP is already cached from a recent lookup.
+If cached: this step takes near-zero time — maybe 1ms.
+If not cached (first launch, or the TTL expired): the request goes to a recursive resolver, which walks the hierarchy (root → TLD → authoritative) to resolve the name. This could add 20–120ms.
+
+Why it matters: this is literally the first millisecond of the entire interaction, and it's invisible to the user, but it's real latency being spent before any actual "logic" happens.
+
+Step 2 — TCP Connection (the handshake)
+
+Now that the app has the IP address, it can't just start blurting out data. It needs to establish a reliable connection first.
+
+This is the TCP three-way handshake: the client says "can we talk?", the server says "yes, go ahead", the client says "great, starting now."
+If this is HTTPS (which it should be, since this app handles user data and orders), there's also a TLS handshake on top of TCP to set up encryption. That adds a bit more round-trip time.
+
+Why it matters: this is a real cost paid on every new connection. It's part of why HTTP/2's ability to reuse one connection for many requests (multiplexing, which you already learned) is such a big performance win — you pay this handshake cost once, not repeatedly.
+
+Step 3 — HTTP Method Choice
+
+The app is fetching the user's existing orders — not creating, updating, or deleting anything. So the method is:
+
+GET
+
+Why GET specifically: GET is for read-only operations that don't change server state. Tapping "My Orders" reads data — it doesn't create a new order or modify one. That's the deciding factor.
+
+Step 4 — The URL
+
+The URL identifies which resource we want. A well-designed REST API would look like:
+
+GET /api/orders
+
+or, if we want to be more specific (e.g. only orders belonging to the logged-in user):
+
+GET /api/users/99/orders
+
+Why it matters: in REST design, the URL describes the resource ("orders belonging to user 99"), and the HTTP method describes the action ("GET" = fetch). This separation is exactly the core REST idea you already recited earlier.
+
+Step 5 — Headers, and why they matter here specifically
+
+This is where statelessness becomes very concrete, not just theoretical.
+
+Because HTTP is stateless, the server has zero memory of the fact that this user logged in five minutes ago. Every single request must prove identity all over again. So this GET request must carry:
+
+Authorization: Bearer <token>
+Accept: application/json
+Host: api.foodapp.com
+Authorization — proves who is asking. Without this, the server has no idea it's "user 99" making the request — remember, no memory between requests.
+Accept: application/json — tells the server "please send the response back as JSON," which the app knows how to parse.
+Host — tells the server which website/domain is being targeted (useful since one physical server can host multiple domains).
+
+Why this connects to statelessness: if HTTP weren't stateless — if the server remembered you from the login request — you wouldn't need to attach this token every time. But because it's stateless, every request is a fresh introduction. This is the direct, concrete payoff of the abstract concept you memorized earlier.
+
+Step 6 — Server Processing and Status Code
+
+The server receives the request and does two things in order:
+
+Checks the Authorization header first. If the token is missing, expired, or invalid → the server immediately responds 401 Unauthorized — it doesn't even bother looking at whether the user has orders. Identity comes before data.
+If the token is valid, the server looks up orders belonging to user 99 in the database (this is where Stage 2, which we haven't covered yet, comes in) and responds:
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  {"order_id": 42, "status": "delivered", "total": 450},
+  {"order_id": 41, "status": "cancelled", "total": 300}
+]
+
+Why 200, not 201: remember — 201 is only for creation. This is a GET/fetch, so 200 is the correct code here. (This is the reverse of the mistake you made earlier with POST — good contrast to notice.)
+
+Step 7 — Rendering
+
+The app receives this JSON body, parses it, and draws the order list on screen. The DNS lookup, the handshake, the headers, the token check — all of that invisible machinery happened in maybe 100–300 milliseconds, and the user just sees their orders appear.
+
+The full chain, compressed into one line:
+
+DNS resolves the domain → TCP/TLS handshake establishes a secure channel → GET request is sent with an Authorization header (because HTTP is stateless and proves nothing on its own) → server validates identity first, then fetches data → responds 200 OK with JSON → app renders it.
+
+
+
+
+
+1. User logs in
+       ↓
+2. Server verifies username/password
+       ↓
+3. Server gives client a token
+       ↓
+4. Client stores token
+       ↓
+5. Client makes another request
+       ↓
+   Authorization: Bearer ABC123
+       ↓
+6. Server receives it
+       ↓
+7. Server validates token
+       ↓
+8. Server allows/denies access
+
+
+Could you use something other than FastAPI?
+
+Absolutely.
+
+The same API could be built with:
+
+Python: FastAPI, Django, Flask
+JavaScript/TypeScript: Express, NestJS
+Java: Spring Boot
+C#: ASP.NET Core
+Go: Gin, Fiber, standard library
+Ruby: Rails
