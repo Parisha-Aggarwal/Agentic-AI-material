@@ -1,0 +1,227 @@
+"""
+Simple end-to-end RAG pipeline — one file, real components.
+
+Pipeline stages:
+  1. Load        - read every PDF in a folder at runtime
+  2. Chunk        - split page text into overlapping windows
+  3. Embed        - sentence-transformers (all-MiniLM-L6-v2, local, free)
+  4. Rewrite/expand query - Gemini rewrites the user's question into a
+                             clearer search query before retrieval
+  5. Filter        - keep only chunks whose metadata matches a filter
+  6. Retrieve       - cosine similarity between query and chunk embeddings
+  7. Generate       - Gemini answers using only the retrieved chunks
+
+Setup:
+    pip install sentence-transformers google-generativeai pypdf numpy
+
+    export GEMINI_API_KEY="your-key-here"
+
+Usage:
+    python rag_pipeline.py --pdf_dir ./my_pdfs --query "What was 2023 revenue?"
+
+Notes:
+  - Put your PDFs in one folder and pass its path with --pdf_dir.
+  - The embedding model downloads once from Hugging Face on first run
+    (needs internet) and is then cached locally.
+  - Swap MODEL_NAME or the Gemini calls out for any other embedding/LLM
+    provider — the rest of the pipeline doesn't need to change.
+"""
+
+import os
+import argparse
+import numpy as np
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+
+
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # small, fast, runs locally/CPU
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
+
+
+# ---------------------------------------------------------------------------
+# 1. LOAD — read every PDF in a folder, page by page
+# ---------------------------------------------------------------------------
+def load_pdfs(pdf_dir):
+    """Returns a list of {text, metadata} records, one per page."""
+    records = []
+    for filename in sorted(os.listdir(pdf_dir)):
+        if not filename.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(pdf_dir, filename)
+        reader = PdfReader(path)
+        for page_num, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            if not text.strip():
+                continue
+            records.append({
+                "text": text,
+                "metadata": {"source": filename, "page": page_num},
+            })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# 2. CHUNK — split page text into overlapping word windows
+# ---------------------------------------------------------------------------
+def chunk_text(text, chunk_size=150, overlap=30):
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunks.append(" ".join(words[start:end]))
+        if end >= len(words):
+            break
+        start += chunk_size - overlap
+    return chunks
+
+
+def build_chunk_store(page_records):
+    store = []
+    for record in page_records:
+        for chunk in chunk_text(record["text"]):
+            store.append({"text": chunk, "metadata": record["metadata"]})
+    return store
+
+
+# ---------------------------------------------------------------------------
+# 3. EMBED — sentence-transformers, run locally, no API calls/cost
+# ---------------------------------------------------------------------------
+class Embedder:
+    def __init__(self, model_name=EMBED_MODEL_NAME):
+        self.model = SentenceTransformer(model_name)
+
+    def embed(self, texts):
+        # normalize_embeddings=True lets us use a plain dot product as cosine similarity
+        return self.model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+
+
+# ---------------------------------------------------------------------------
+# 4. QUERY REWRITING — ask Gemini to turn the raw question into a
+#    cleaner, keyword-rich search query (handles typos, vague phrasing,
+#    conversational filler, etc.)
+# ---------------------------------------------------------------------------
+def rewrite_query(raw_query, model):
+    prompt = (
+        "Rewrite the user's question as a short, keyword-rich search query "
+        "suitable for embedding-based document retrieval. Keep it concise. "
+        "Return ONLY the rewritten query, nothing else.\n\n"
+        f"Question: {raw_query}"
+    )
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+
+# ---------------------------------------------------------------------------
+# 5. METADATA FILTERING
+# ---------------------------------------------------------------------------
+def filter_by_metadata(chunk_store, filters):
+    if not filters:
+        return list(range(len(chunk_store)))
+    return [
+        i for i, record in enumerate(chunk_store)
+        if all(record["metadata"].get(k) == v for k, v in filters.items())
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 6. RETRIEVE — rewrite query -> filter -> cosine similarity ranking
+# ---------------------------------------------------------------------------
+def retrieve(raw_query, chunk_store, chunk_embeddings, embedder, gemini_model,
+             top_k=4, metadata_filters=None):
+    search_query = rewrite_query(raw_query, gemini_model)
+    query_vec = embedder.embed([search_query])[0]
+
+    candidate_idx = filter_by_metadata(chunk_store, metadata_filters)
+    if not candidate_idx:
+        return search_query, []
+
+    candidate_vecs = chunk_embeddings[candidate_idx]
+    sims = candidate_vecs @ query_vec  # cosine similarity (vectors are normalized)
+
+    ranked = sorted(zip(candidate_idx, sims), key=lambda x: x[1], reverse=True)
+    top = ranked[:top_k]
+
+    results = [
+        {**chunk_store[idx], "score": float(score)}
+        for idx, score in top
+    ]
+    return search_query, results
+
+
+# ---------------------------------------------------------------------------
+# 7. GENERATE — Gemini answers using only the retrieved chunks
+# ---------------------------------------------------------------------------
+def generate_answer(raw_query, retrieved_chunks, model):
+    context = "\n\n".join(
+        f"[{i+1}] (source={c['metadata']['source']}, page={c['metadata']['page']}) {c['text']}"
+        for i, c in enumerate(retrieved_chunks)
+    )
+    prompt = (
+        "Answer the question using ONLY the context below. "
+        "Cite sources like [1], [2]. If the answer isn't in the context, say so.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {raw_query}\n"
+        "Answer:"
+    )
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pdf_dir", required=True, help="Folder containing PDFs")
+    parser.add_argument("--query", required=True, help="Question to ask")
+    parser.add_argument("--source_filter", default=None,
+                         help="Optional: only search a specific PDF filename")
+    parser.add_argument("--top_k", type=int, default=4)
+    args = parser.parse_args()
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise SystemExit("Set GEMINI_API_KEY in your environment first.")
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+
+    print(f"Loading PDFs from: {args.pdf_dir}")
+    page_records = load_pdfs(args.pdf_dir)
+    if not page_records:
+        raise SystemExit("No extractable text found in that folder.")
+
+    chunk_store = build_chunk_store(page_records)
+    print(f"Built {len(chunk_store)} chunks from {len(page_records)} pages.")
+
+    print(f"Embedding chunks with '{EMBED_MODEL_NAME}' ...")
+    embedder = Embedder()
+    chunk_embeddings = embedder.embed([c["text"] for c in chunk_store])
+
+    metadata_filters = {"source": args.source_filter} if args.source_filter else None
+
+    search_query, results = retrieve(
+        args.query, chunk_store, chunk_embeddings, embedder, gemini_model,
+        top_k=args.top_k, metadata_filters=metadata_filters,
+    )
+
+    print(f"\nOriginal query : {args.query}")
+    print(f"Rewritten query: {search_query}")
+    if metadata_filters:
+        print(f"Metadata filter: {metadata_filters}")
+
+    print("\nTop retrieved chunks:")
+    for r in results:
+        print(f"  score={r['score']:.3f} | {r['metadata']}")
+        print(f"  {r['text'][:200]}...\n")
+
+    answer = generate_answer(args.query, results, gemini_model)
+    print("=" * 60)
+    print("ANSWER")
+    print("=" * 60)
+    print(answer)
+
+
+if __name__ == "__main__":
+    main()
